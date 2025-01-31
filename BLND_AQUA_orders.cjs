@@ -56,22 +56,34 @@ async function cancelExistingOrders() {
 
 async function placeBuyOrders(spotPrice) {
     try {
+        console.log('\n=== Starting Order Placement ===');
+        console.log('Initial spot price:', spotPrice);
+        console.log('Number of buckets:', NUM_BUCKETS);
+        console.log('Bucket increment:', BUCKET_INCREMENT);
+        console.log('Unit size:', UNIT_SIZE);
+        
         const sourceKeypair = StellarSdk.Keypair.fromSecret(process.env.STELLAR_PRIVATE_KEY);
         const account = await server.loadAccount(sourceKeypair.publicKey());
+        console.log('\nAccount loaded:', sourceKeypair.publicKey());
         
         const placedOrders = [];
         
         for (let i = 1; i <= NUM_BUCKETS; i++) {
+            console.log('\n--- Processing Bucket', i, '---');
             const discount = 1 - (BUCKET_INCREMENT * i);
+            console.log('Calculated discount:', discount.toFixed(4));
+            
             const orderPrice = spotPrice * discount;
+            console.log('Raw order price:', orderPrice.toFixed(7));
             
             // Convert order price to price fraction for Stellar
-            // Price is in AQUA/BLND, so we need to represent how many AQUA for 1 BLND
             const priceNumerator = parseInt((orderPrice * 10000000).toFixed(0));
             const priceObj = {
                 n: priceNumerator,
                 d: 10000000
             };
+            console.log('Price fraction:', `${priceObj.n}/${priceObj.d}`);
+            console.log('Decimal price:', (priceObj.n / priceObj.d).toFixed(7));
 
             const operation = StellarSdk.Operation.manageBuyOffer({
                 selling: AQUA,
@@ -80,6 +92,11 @@ async function placeBuyOrders(spotPrice) {
                 price: priceObj,
                 offerId: 0
             });
+            
+            console.log('\nOrder details:');
+            console.log('- Buy amount:', UNIT_SIZE.toFixed(7), 'BLND');
+            console.log('- Price:', orderPrice.toFixed(7), 'AQUA/BLND');
+            console.log('- Total AQUA needed:', (UNIT_SIZE * orderPrice).toFixed(7));
 
             const tx = new StellarSdk.TransactionBuilder(account, {
                 fee: await server.fetchBaseFee(),
@@ -91,14 +108,13 @@ async function placeBuyOrders(spotPrice) {
 
             tx.sign(sourceKeypair);
             
-            console.log(`Placing order ${i}: ${UNIT_SIZE} BLND at ${orderPrice.toFixed(7)} AQUA/BLND`);
+            console.log('\nSubmitting transaction...');
             const result = await server.submitTransaction(tx);
 
             if (result.successful) {
-                console.log(`Order ${i} placed successfully!`);
+                console.log(`✅ Order ${i} placed successfully!`);
                 console.log('Transaction ID:', result.id);
                 
-                // Add order to tracking array
                 placedOrders.push({
                     orderId: result.id,
                     amount: UNIT_SIZE,
@@ -106,7 +122,6 @@ async function placeBuyOrders(spotPrice) {
                     bucket: i
                 });
 
-                // Emit event for placed order
                 buyOrderEmitter.emit('orderPlaced', {
                     orderId: result.id,
                     amount: UNIT_SIZE,
@@ -114,15 +129,22 @@ async function placeBuyOrders(spotPrice) {
                     bucket: i
                 });
             } else {
-                console.error(`Order ${i} failed:`, JSON.stringify(result.extras.result_codes, null, 2));
+                console.error(`❌ Order ${i} failed:`, JSON.stringify(result.extras.result_codes, null, 2));
             }
         }
 
-        // Emit event for all orders placed
+        console.log('\n=== Order Placement Complete ===');
+        console.log('Total orders placed:', placedOrders.length);
+        console.log('Price range:', placedOrders.length > 0 ? {
+            highest: placedOrders[0].price.toFixed(7),
+            lowest: placedOrders[placedOrders.length - 1].price.toFixed(7)
+        } : 'No orders placed');
+        
         buyOrderEmitter.emit('allOrdersPlaced', placedOrders);
         return placedOrders;
         
     } catch (error) {
+        console.error('\n❌ Error in placeBuyOrders:');
         if (error.response && error.response.data) {
             console.error('Error details:', JSON.stringify(error.response.data, null, 2));
         } else {
@@ -179,17 +201,29 @@ module.exports = {
     NUM_BUCKETS
 };
 
-// Only run main if script is run directly
+// Update main function to use real spot price
 if (require.main === module) {
     async function main() {
-        const spotPrice = 1.5; // Example spot price
-        
         if (process.argv.includes('--check')) {
             await checkActiveOrders();
         } else if (process.argv.includes('--cancel')) {
             await cancelExistingOrders();
         } else {
-            await placeBuyOrders(spotPrice);
+            console.log('Waiting for spot price data...');
+            
+            // Import the ESM module dynamically
+            const spotPriceModule = await import('./spot_priceBLND_AQUA.js');
+            const { balanceMonitor, startMonitor } = spotPriceModule;
+            
+            // Wait for first price update
+            balanceMonitor.once('update', async (data) => {
+                console.log('Received spot price:', data.spotPrice);
+                await placeBuyOrders(data.spotPrice);
+                process.exit(0);
+            });
+            
+            // Start the monitor
+            startMonitor();
         }
     }
 
